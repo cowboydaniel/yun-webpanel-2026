@@ -136,6 +136,7 @@
   let pollTimer = null;
   let clockTimer = null;
   let clockOffset = null;   // board time minus this computer's time, in ms
+  let pollSentAt = 0;       // when the last status request was sent
   let dataTimer = null;
   let lastData = {};
 
@@ -172,10 +173,7 @@
     const host = s.hostname || 'Arduino';
     document.title = `${host} · Yún Panel`;
     $('#board-name').textContent = host;
-    // Status arrives every 3 s; the clock ticks every second from the
-    // board's time, measured against this computer's clock.
-    clockOffset = s.time ? s.time * 1000 - Date.now() : null;
-    renderClock();
+    syncClock(s.time, pollSentAt);
 
     const pill = $('#conn-pill');
     pill.className = 'pill is-ok';
@@ -259,9 +257,33 @@
     ]);
   }
 
+  // The header clock. Status arrives every 3 s with the board's time in whole
+  // seconds, so one reading only pins the board's clock to within a second.
+  // Each reading taken when the reply arrives is a lower bound on the offset
+  // (the board's clock can only have moved on since), and one taken when the
+  // request was sent, plus a second, is an upper bound. Keep the highest lower
+  // bound, and start again only if a reading falls outside those bounds (the
+  // board's clock was changed). Then tick on the board's second boundaries.
+  function syncClock(time, sentAt) {
+    if (!time) { clockOffset = null; return; }
+    const lower = time * 1000 - Date.now();
+    const upper = time * 1000 + 1000 - sentAt;
+    if (clockOffset == null || clockOffset > upper || clockOffset < lower - 2000) clockOffset = lower;
+    else clockOffset = Math.max(clockOffset, lower);
+    tickClock();
+  }
+
   function renderClock() {
     const time = clockOffset == null ? null : new Date(Date.now() + clockOffset).toLocaleString();
     $('#board-sub').textContent = [status?.model, time].filter(Boolean).join(' · ');
+  }
+
+  function tickClock() {
+    clearTimeout(clockTimer);
+    renderClock();
+    if (clockOffset == null) return;
+    const ms = (Date.now() + clockOffset) % 1000;
+    clockTimer = setTimeout(tickClock, 1000 - ms + 15);
   }
 
   function drawSpark(canvas, values) {
@@ -287,6 +309,7 @@
 
   async function poll() {
     try {
+      pollSentAt = Date.now();
       renderStatus(await api.call('yun', 'status'));
     } catch (err) {
       if (err.code === 'auth') return signedOut();
@@ -543,7 +566,7 @@
 
   function signedOut() {
     clearInterval(pollTimer);
-    clearInterval(clockTimer);
+    clearTimeout(clockTimer);
     clearInterval(dataTimer);
     api.logout();
     $('#shell').hidden = true;
@@ -557,7 +580,6 @@
     showView(location.hash.slice(1) || 'overview');
     await poll();
     pollTimer = setInterval(poll, 3000);
-    clockTimer = setInterval(renderClock, 1000);
   }
 
   async function start() {
