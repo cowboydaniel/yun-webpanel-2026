@@ -2,9 +2,10 @@
 # Install the Yun Panel on this Yun. Run from an unpacked copy of the repo;
 # install.sh on a PC does this over SSH.
 #
-# Only adds files: the panel goes in /www/yun-panel/, next to whatever web
-# panel the firmware already has. Every file written is listed in
-# /usr/share/yun-panel/installed-files so board/uninstall.sh can remove them.
+# The panel goes in /www/yun-panel/, next to whatever web panel the firmware
+# already has. Every file added is listed in /usr/share/yun-panel/installed-files
+# so board/uninstall.sh can remove them. The only existing file it changes is
+# the stock /www/index.html redirect, which it keeps a copy of.
 
 set -e
 
@@ -56,10 +57,24 @@ if [ $BACKEND = 1 ]; then
 	fi
 fi
 
+# Open the panel at the root address. Only replace a root page that sends
+# visitors to the old LuCI panel (as the stock firmware's does), and keep it
+# so board/uninstall.sh can put it back.
+ROOT=/www/index.html
+if grep -q 'yun-panel redirect' "$ROOT" 2>/dev/null; then
+	cp "$SRC/www/index-redirect.html" "$ROOT"
+elif [ ! -e "$ROOT" ] || grep -q 'cgi-bin/luci' "$ROOT"; then
+	[ -e "$ROOT" ] && cp "$ROOT" "$LIB/index.html.orig"
+	cp "$SRC/www/index-redirect.html" "$ROOT"
+	chmod 644 "$ROOT"
+else
+	echo "Left $ROOT alone: it isn't the stock redirect. The panel is at /yun-panel/."
+fi
+
 echo "$MANIFEST" >> "$MANIFEST.new"
 mv "$MANIFEST.new" "$MANIFEST"
 
 # rpcd reads plugins and ACLs at start. Restarting it signs out open sessions.
 [ $BACKEND = 1 ] && /etc/init.d/rpcd restart
 
-echo "Yun Panel installed: http://$(uci -q get system.@system[0].hostname || echo arduino).local/yun-panel/"
+echo "Yun Panel installed: http://$(uci -q get system.@system[0].hostname || echo arduino).local/"

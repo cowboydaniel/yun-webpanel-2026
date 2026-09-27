@@ -8,6 +8,16 @@ if [ ! -f "$MANIFEST" ]; then
 	exit 0
 fi
 
+# Put back the root page the panel replaced.
+if grep -q 'yun-panel redirect' /www/index.html 2>/dev/null; then
+	if [ -f /usr/share/yun-panel/index.html.orig ]; then
+		cp /usr/share/yun-panel/index.html.orig /www/index.html
+	else
+		rm -f /www/index.html
+	fi
+fi
+rm -f /usr/share/yun-panel/index.html.orig
+
 while read -r f; do
 	rm -f "$f"
 done < "$MANIFEST"

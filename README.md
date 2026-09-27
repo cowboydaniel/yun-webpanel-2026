@@ -2,7 +2,7 @@
 
 A modern web panel for the Arduino Yún that installs on the **stock Yún firmware** as well as on [Arduino Yún 2026](https://github.com/cowboydaniel/arduino-yun-2026). You don't need to update the firmware to use it.
 
-It's added next to the stock panel, at `http://arduino.local/yun-panel/`, and doesn't change the firmware, the Bridge or the stock web panel. Only the Yún Rev1 is supported.
+It opens at the board's own address (`http://arduino.local/`, served from `/yun-panel/`) and doesn't change the firmware or the Bridge. The stock web panel is still there, at `http://arduino.local/cgi-bin/luci/webpanel/homepage`. Only the Yún Rev1 is supported.
 
 The front end is a copy of the panel in arduino-yun-2026 (`feed/yun-webpanel`, as of commit `b7e4bcd`). That copy stays where it is. This repo adds a back end that runs on both firmwares, plus a few small front-end changes for the stock firmware.
 
@@ -26,7 +26,7 @@ From a PC that can reach the Yún over SSH:
 ./install.sh root@arduino.local
 ```
 
-Then open `http://arduino.local/yun-panel/` and sign in as root with the board's password.
+Then open `http://arduino.local/` and sign in as root with the board's password.
 
 The stock firmware's SSH server is old, so recent OpenSSH clients need legacy options. Add this to `~/.ssh/config`:
 
@@ -45,11 +45,14 @@ To remove it:
 
 You can also copy the repo onto the board and run `sh board/install.sh` or `sh board/uninstall.sh` there.
 
-The installer only adds files, and lists every one in `/usr/share/yun-panel/installed-files`, so uninstalling removes exactly what it added. It then restarts `rpcd`, which signs out any open panel sessions.
+The installer adds files, and lists every one in `/usr/share/yun-panel/installed-files`, so uninstalling removes exactly what it added. It then restarts `rpcd`, which signs out any open panel sessions.
+
+It changes one existing file. `/www/index.html` on the stock firmware just redirects to the old panel, and the installer replaces it with a redirect to `/yun-panel/`. The original is kept in `/usr/share/yun-panel/index.html.orig`, and uninstalling puts it back. If the root page is anything other than a redirect to the old LuCI panel, for example Arduino Yún 2026's own panel, the installer leaves it alone.
 
 | File on the board | Purpose |
 | --- | --- |
 | `/www/yun-panel/` | The panel |
+| `/www/index.html` | Redirect to the panel (replaces the stock redirect; restored on uninstall) |
 | `/usr/libexec/rpcd/yun` | The `yun` ubus object (the back end) |
 | `/usr/share/rpcd/acl.d/yun-panel.json` | Access rights for signed-in users |
 | `/usr/share/yun-panel/helper.py` | Bridge datastore, Mailbox, password hash |
