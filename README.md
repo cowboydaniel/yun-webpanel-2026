@@ -15,6 +15,7 @@ The front end is a copy of the panel in arduino-yun-2026 (`feed/yun-webpanel`, a
 - Shows and edits the Bridge datastore, and sends Mailbox messages
 - Changes the hostname, time zone, REST API password setting and root password
 - Restarts the Yún
+- Light, dark or automatic appearance, chosen in Settings and remembered in the browser
 
 Firmware updates from the panel aren't available yet. The panel says so, and doesn't pretend the board is up to date.
 

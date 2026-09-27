@@ -450,6 +450,26 @@
     'Europe/Rome', 'Pacific/Auckland',
   ];
 
+  // --- Appearance ----------------------------------------------------------
+
+  function setupTheme() {
+    let saved = 'auto';
+    try { saved = localStorage.getItem('yun-theme') || 'auto'; } catch (e) { /* no storage */ }
+    const pick = $(`#theme-seg input[value="${saved}"]`) || $('#theme-seg input[value="auto"]');
+    pick.checked = true;
+    $('#theme-seg').addEventListener('change', (ev) => {
+      const theme = ev.target.value;
+      if (theme === 'auto') delete document.documentElement.dataset.theme;
+      else document.documentElement.dataset.theme = theme;
+      try {
+        if (theme === 'auto') localStorage.removeItem('yun-theme');
+        else localStorage.setItem('yun-theme', theme);
+      } catch (e) { /* not saved, but still applied until the page reloads */ }
+      // The memory graph reads the accent colour when it draws.
+      drawSpark($('#mem-spark'), memHistory);
+    });
+  }
+
   function setupSettings() {
     $('#set-zone').replaceChildren(...ZONES.map((z) => el('option', { value: z }, z.replace(/_/g, ' '))));
 
@@ -583,6 +603,7 @@
     });
     setupDropzones();
     setupSettings();
+    setupTheme();
 
     $('#app').classList.remove('booting');
     // Reuse a session from this tab if it's still valid.
