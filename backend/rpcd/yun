@@ -34,12 +34,13 @@ trap 'rm -f "$TMP"' EXIT
 # them back with Number().
 
 fail() {
-	# Print an error message and exit non-zero, which rpcd reports as a failed
-	# call.
+	# Reply with {"error": "..."}, which the panel shows as the message (the
+	# same convention as Yun 2026's own backend). The call itself succeeds,
+	# because rpcd would drop the message from a failed one.
 	json_init
 	json_add_string error "$1"
 	json_dump
-	exit 1
+	exit 0
 }
 
 ok() {
