@@ -1,6 +1,6 @@
-# Yún Panel (backwards-compatible)
+# yun-webpanel-2026
 
-A modern web panel for the Arduino Yún that installs on the **stock Yún firmware** as well as on [Arduino Yún 2026](https://github.com/cowboydaniel/arduino-yun-2026). You don't need to update the firmware to use it.
+The Yún Panel: a modern web panel for the Arduino Yún that installs on the **stock Yún firmware** as well as on [Arduino Yún 2026](https://github.com/cowboydaniel/arduino-yun-2026). You don't need to update the firmware to use it.
 
 It's added next to the stock panel, at `http://arduino.local/yun-panel/`, and doesn't change the firmware, the Bridge or the stock web panel. Only the Yún Rev1 is supported.
 
