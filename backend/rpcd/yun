@@ -1,0 +1,558 @@
+#!/bin/sh
+# rpcd plugin for the Yun Panel: the "yun" ubus object.
+#
+# Installed as /usr/libexec/rpcd/yun. rpcd runs it as "yun list" to learn the
+# methods, and as "yun call <method>" with the arguments as JSON on stdin.
+#
+# It runs on both the stock Arduino Yun firmware (OpenWrtYun / Linino, 2015
+# rpcd, busybox, Python 2) and Arduino Yun 2026 (OpenWrt 25.12, Python 3), and
+# uses each system's own tools: uci, iwinfo, run-avrdude, reset-mcu,
+# kill-bridge, and yun-wifi where it exists.
+
+. /usr/share/libubox/jshn.sh
+
+LIB=/usr/share/yun-panel
+SKETCH=/tmp/sketch.hex
+
+# The stock firmware has /etc/arduino/openwrt-yun-release and no yun-wifi.
+if [ -f /etc/arduino/openwrt-yun-release ] && ! command -v yun-wifi >/dev/null; then
+	STOCK=1
+else
+	STOCK=0
+fi
+
+PY=$(command -v python3 || command -v python)
+
+TMP=/tmp/yun-panel.$$
+trap 'rm -f "$TMP"' EXIT
+
+# --- Helpers -----------------------------------------------------------------
+#
+# Byte counts and load averages are sent as strings. The stock firmware's 2015
+# ubus has no floating-point type and caps integers at 2^31 - 1, so a 64 GB SD
+# card or a load of 0.42 can't be sent as numbers there. The panel converts
+# them back with Number().
+
+fail() {
+	# Print an error message and exit non-zero, which rpcd reports as a failed
+	# call.
+	json_init
+	json_add_string error "$1"
+	json_dump
+	exit 1
+}
+
+ok() {
+	json_init
+	json_dump
+}
+
+# Run a command in the background, detached from rpcd's stdout, so the call
+# can return before the network goes away or the board reboots.
+later() {
+	( sleep 2; "$@" ) </dev/null >/dev/null 2>&1 &
+}
+
+net_stat() {
+	cat "/sys/class/net/$1/statistics/$2" 2>/dev/null || echo 0
+}
+
+ipv4_of() {
+	if command -v ip >/dev/null; then
+		ip -4 -o addr show dev "$1" 2>/dev/null | awk '{ split($4, a, "/"); print a[1]; exit }'
+	else
+		ifconfig "$1" 2>/dev/null | sed -n 's/.*inet addr:\([0-9.]*\).*/\1/p'
+	fi
+}
+
+# Default gateway through a device, from /proc/net/route.
+gateway_of() {
+	local hex
+	hex=$(awk -v dev="$1" '$1 == dev && $2 == "00000000" { print $3; exit }' /proc/net/route)
+	[ -n "$hex" ] || return
+	printf '%d.%d.%d.%d\n' 0x${hex#??????} 0x$(echo $hex | cut -c5-6) 0x$(echo $hex | cut -c3-4) 0x${hex%??????}
+}
+
+# The wireless interface that's currently up (wlan0 on stock, phy0-sta0 or
+# phy0-ap0 on OpenWrt 25.12).
+wifi_dev() {
+	local d first=
+	for d in /sys/class/net/*; do
+		[ -e "$d/phy80211" ] || continue
+		[ -z "$first" ] && first=${d##*/}
+		if [ "$(cat "$d/operstate" 2>/dev/null)" = up ]; then
+			echo "${d##*/}"
+			return
+		fi
+	done
+	echo "${first:-wlan0}"
+}
+
+wifi_mode() {
+	if [ $STOCK = 1 ]; then
+		case "$(uci -q get wireless.@wifi-iface[0].mode)" in
+			sta) echo client ;;
+			*) echo ap ;;
+		esac
+	else
+		yun-wifi status 2>/dev/null || echo ap
+	fi
+}
+
+ap_ssid() {
+	if [ $STOCK = 0 ]; then
+		yun-wifi ssid
+		return
+	fi
+	local name mac
+	name=$(uci -q get arduino.@arduino[0].access_point_wifi_name)
+	if [ -z "$name" ] || [ "$name" = Arduino ]; then
+		mac=$(cat /sys/class/ieee80211/phy0/macaddress 2>/dev/null | tr -d : | tr a-f A-F)
+		name="Arduino Yun-$mac"
+	fi
+	echo "$name"
+}
+
+wifi_iface_section() {
+	if [ $STOCK = 1 ]; then
+		echo '@wifi-iface[0]'
+	else
+		echo yun_sta
+	fi
+}
+
+# The Linux side's firmware description.
+firmware_info() {
+	local DISTRIB_DESCRIPTION DISTRIB_RELEASE
+	. /etc/openwrt_release 2>/dev/null
+	FW_OPENWRT=$DISTRIB_DESCRIPTION
+	if [ $STOCK = 1 ]; then
+		FW_VERSION="Stock $DISTRIB_RELEASE"
+		FW_DESC="Stock Arduino Yun firmware ($(cat /etc/arduino/openwrt-yun-release 2>/dev/null))"
+	elif [ -r /etc/yun-release ]; then
+		FW_VERSION=$(head -n 1 /etc/yun-release)
+		FW_DESC="$FW_VERSION on $DISTRIB_DESCRIPTION"
+	else
+		FW_VERSION=$DISTRIB_DESCRIPTION
+		FW_DESC=$DISTRIB_DESCRIPTION
+	fi
+}
+
+add_storage() {
+	# add_storage <name> <mount point>
+	local line
+	line=$(df -P -k "$2" 2>/dev/null | tail -n 1)
+	[ -n "$line" ] || return
+	set -- "$1" $line
+	json_add_object
+	json_add_string name "$1"
+	json_add_string used "$(($4 * 1024))"
+	json_add_string total "$(($3 * 1024))"
+	json_close_object
+}
+
+# POSIX TZ strings for the time zones the panel offers.
+tz_for() {
+	case "$1" in
+	UTC) echo UTC0 ;;
+	Africa/Johannesburg) echo SAST-2 ;;
+	America/Chicago) echo 'CST6CDT,M3.2.0,M11.1.0' ;;
+	America/Denver) echo 'MST7MDT,M3.2.0,M11.1.0' ;;
+	America/Los_Angeles) echo 'PST8PDT,M3.2.0,M11.1.0' ;;
+	America/New_York|America/Toronto) echo 'EST5EDT,M3.2.0,M11.1.0' ;;
+	America/Sao_Paulo) echo '<-03>3' ;;
+	Asia/Dubai) echo '<+04>-4' ;;
+	Asia/Kolkata) echo 'IST-5:30' ;;
+	Asia/Shanghai) echo CST-8 ;;
+	Asia/Singapore) echo '<+08>-8' ;;
+	Asia/Tokyo) echo JST-9 ;;
+	Australia/Adelaide) echo 'ACST-9:30ACDT,M10.1.0,M4.1.0/3' ;;
+	Australia/Brisbane) echo AEST-10 ;;
+	Australia/Melbourne|Australia/Sydney) echo 'AEST-10AEDT,M10.1.0,M4.1.0/3' ;;
+	Australia/Perth) echo AWST-8 ;;
+	Europe/Amsterdam|Europe/Berlin|Europe/Madrid|Europe/Paris|Europe/Rome) echo 'CET-1CEST,M3.5.0,M10.5.0/3' ;;
+	Europe/London) echo 'GMT0BST,M3.5.0/1,M10.5.0' ;;
+	Pacific/Auckland) echo 'NZST-12NZDT,M9.5.0,M4.1.0/3' ;;
+	*) return 1 ;;
+	esac
+}
+
+# --- Methods -----------------------------------------------------------------
+
+m_status() {
+	local up load1 load5 load15 total avail dev mode ssid info signal channel quality
+	local ap_mac eth ov_dev
+
+	firmware_info
+	read up _ < /proc/uptime
+	read load1 load5 load15 _ < /proc/loadavg
+	total=$(awk '/^MemTotal:/ { print $2 * 1024 }' /proc/meminfo)
+	avail=$(awk '/^MemAvailable:/ { print $2 * 1024 }' /proc/meminfo)
+	[ -n "$avail" ] || avail=$(awk '/^(MemFree|Buffers|Cached):/ { s += $2 } END { print s * 1024 }' /proc/meminfo)
+
+	json_init
+	json_add_string hostname "$(uci -q get system.@system[0].hostname)"
+	json_add_string model "$(cat /tmp/sysinfo/model 2>/dev/null || echo 'Arduino Yun')"
+	json_add_int time "$(date +%s)"
+	json_add_int uptime "${up%.*}"
+	json_add_array load
+	json_add_string "" "$load1"
+	json_add_string "" "$load5"
+	json_add_string "" "$load15"
+	json_close_array
+	json_add_string zonename "$(uci -q get system.@system[0].zonename)"
+	json_add_boolean rest_secure "$([ "$(uci -q get arduino.@arduino[0].secure_rest_api)" = true ] && echo 1 || echo 0)"
+
+	json_add_object firmware
+	json_add_string version "$FW_VERSION"
+	json_add_string openwrt "$FW_OPENWRT"
+	json_add_string kernel "$(uname -r)"
+	json_add_string description "$FW_DESC"
+	json_close_object
+
+	json_add_object bridge
+	json_add_boolean running "$(pgrep -f 'bridge\.py' >/dev/null && echo 1 || echo 0)"
+	json_close_object
+
+	json_add_object memory
+	json_add_string total "$total"
+	json_add_string available "$avail"
+	json_close_object
+
+	json_add_array storage
+	ov_dev=$(awk '$2 == "/overlay" { print $1; exit }' /proc/mounts)
+	case "$ov_dev" in
+		/dev/sd*) add_storage "SD card (extroot)" /overlay ;;
+		'') add_storage "Internal flash" / ;;
+		*) add_storage "Internal flash" /overlay ;;
+	esac
+	# (Loops read from a file, not a pipe: jshn keeps its state in shell
+	# variables, which a pipe's subshell would lose.)
+	awk '$1 ~ /^\/dev\/sd/ && $2 != "/overlay" { print $1, $2 }' /proc/mounts > "$TMP"
+	while read -r d m; do
+		add_storage "Storage (${d#/dev/})" "$m"
+	done < "$TMP"
+	json_close_array
+
+	# Wi-Fi
+	dev=$(wifi_dev)
+	mode=$(wifi_mode)
+	json_add_object wifi
+	json_add_string mode "$mode"
+	json_add_string ap_ssid "$(ap_ssid)"
+	json_add_string ipv4 "$(ipv4_of "$dev")"
+	json_add_string mac "$(cat "/sys/class/net/$dev/address" 2>/dev/null)"
+	json_add_string rx_bytes "$(net_stat "$dev" rx_bytes)"
+	json_add_string tx_bytes "$(net_stat "$dev" tx_bytes)"
+	if [ "$mode" = client ]; then
+		info=$(iwinfo "$dev" info 2>/dev/null)
+		ap_mac=$(echo "$info" | sed -n 's/.*Access Point: \([0-9A-Fa-f:]*\).*/\1/p')
+		ssid=$(uci -q get "wireless.$(wifi_iface_section).ssid")
+		signal=$(echo "$info" | sed -n 's/.*Signal: \(-\{0,1\}[0-9]*\) dBm.*/\1/p')
+		channel=$(echo "$info" | sed -n 's/.*Channel: \([0-9]*\).*/\1/p')
+		quality=$(echo "$info" | sed -n 's/.*Link Quality: \([0-9]*\)\/\([0-9]*\).*/\1 \2/p' | awk '$2 { print int($1 * 100 / $2) }')
+		json_add_string ssid "$ssid"
+		json_add_string encryption "$(uci -q get "wireless.$(wifi_iface_section).encryption")"
+		if [ -n "$ap_mac" ] && [ "$ap_mac" != 00:00:00:00:00:00 ]; then
+			json_add_boolean connected 1
+			[ -n "$signal" ] && json_add_int signal "$signal"
+			[ -n "$channel" ] && json_add_int channel "$channel"
+			[ -n "$quality" ] && json_add_int quality "$quality"
+		else
+			json_add_boolean connected 0
+		fi
+	else
+		json_add_string ssid "$(ap_ssid)"
+		json_add_int clients "$(iwinfo "$dev" assoclist 2>/dev/null | grep -c dBm)"
+	fi
+	json_close_object
+
+	# Ethernet: the wan interface (eth1 on the Yun).
+	eth=$(ubus call network.interface.wan status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)
+	[ -n "$eth" ] || eth=eth1
+	json_add_object ethernet
+	json_add_boolean carrier "$([ "$(cat "/sys/class/net/$eth/carrier" 2>/dev/null)" = 1 ] && echo 1 || echo 0)"
+	json_add_string ipv4 "$(ipv4_of "$eth")"
+	json_add_string gateway "$(gateway_of "$eth")"
+	json_add_string mac "$(cat "/sys/class/net/$eth/address" 2>/dev/null)"
+	json_add_string rx_bytes "$(net_stat "$eth" rx_bytes)"
+	json_add_string tx_bytes "$(net_stat "$eth" tx_bytes)"
+	json_close_object
+
+	json_dump
+}
+
+m_wifi_scan() {
+	local dev
+	dev=$(wifi_dev)
+	json_init
+	json_add_array results
+	# Each line: quality<TAB>encryption<TAB>ssid
+	iwinfo "$dev" scan 2>/dev/null | awk '
+		function flush() {
+			if (ssid != "") printf "%d\t%s\t%s\n", q, enc, ssid
+			ssid = ""; q = 0; enc = "none"
+		}
+		/^Cell / { flush() }
+		/ESSID: "/ { s = $0; sub(/.*ESSID: "/, "", s); sub(/"$/, "", s); ssid = s }
+		/Quality: / { s = $0; sub(/.*Quality: /, "", s); split(s, a, "/"); if (a[2] > 0) q = a[1] * 100 / a[2] }
+		/Encryption: / {
+			s = $0; sub(/.*Encryption: /, "", s)
+			if (s ~ /none/) enc = "none"
+			else if (s ~ /WPA3/ && s ~ /WPA2/) enc = "sae-mixed"
+			else if (s ~ /WPA3|SAE/) enc = "sae"
+			else if (s ~ /mixed/) enc = "psk-mixed"
+			else if (s ~ /WPA2/) enc = "psk2"
+			else if (s ~ /WPA/) enc = "psk"
+			else if (s ~ /WEP/) enc = "wep"
+			else enc = s
+		}
+		END { flush() }
+	' > "$TMP"
+	while IFS='	' read -r q enc ssid; do
+		json_add_object
+		json_add_string ssid "$ssid"
+		json_add_int quality "$q"
+		json_add_string encryption "$enc"
+		json_close_object
+	done < "$TMP"
+	json_close_array
+	json_dump
+}
+
+m_wifi_client() {
+	local ssid encryption key
+	json_load "$INPUT"
+	json_get_var ssid ssid
+	json_get_var encryption encryption
+	json_get_var key key
+	encryption=${encryption:-psk2}
+
+	[ -n "$ssid" ] || fail "Enter the network name"
+	[ ${#ssid} -le 32 ] || fail "The network name is too long"
+	case "$encryption" in
+		none) key= ;;
+		psk|psk2|psk-mixed|sae|sae-mixed)
+			[ ${#key} -ge 8 ] && [ ${#key} -le 63 ] || fail "The Wi-Fi password must be 8 to 63 characters"
+			;;
+		*) fail "Unsupported encryption: $encryption" ;;
+	esac
+
+	if [ $STOCK = 0 ]; then
+		later yun-wifi client "$ssid" "$encryption" "$key"
+		ok
+		return
+	fi
+
+	case "$encryption" in
+		sae|sae-mixed) fail "The stock firmware doesn't support WPA3" ;;
+	esac
+
+	# Same changes as the stock web panel, which then reboots.
+	uci set wireless.radio0.channel=auto
+	uci set wireless.@wifi-iface[0].mode=sta
+	uci set wireless.@wifi-iface[0].ssid="$ssid"
+	uci set wireless.@wifi-iface[0].encryption="$encryption"
+	uci -q delete wireless.@wifi-iface[0].key
+	[ -n "$key" ] && uci set wireless.@wifi-iface[0].key="$key"
+	uci -q delete network.lan.ipaddr
+	uci -q delete network.lan.netmask
+	uci set network.lan.proto=dhcp
+	uci -q delete dhcp.@dnsmasq[0].interface
+	uci add_list dhcp.@dnsmasq[0].interface=lo
+	if uci -q get arduino.@wifi-iface[0] >/dev/null; then
+		uci set arduino.@wifi-iface[0].mode=sta
+		uci set arduino.@wifi-iface[0].ssid="$ssid"
+		uci set arduino.@wifi-iface[0].encryption="$encryption"
+		uci -q delete arduino.@wifi-iface[0].key
+		[ -n "$key" ] && uci set arduino.@wifi-iface[0].key="$key"
+	fi
+	uci -q set arduino.@arduino[0].wifi_reset_step=clear
+	uci commit
+	later reboot
+	ok
+}
+
+m_wifi_setup_ap() {
+	if [ $STOCK = 1 ]; then
+		later wifi-reset-and-reboot
+	else
+		later yun-wifi ap
+	fi
+	ok
+}
+
+m_sketch_flash() {
+	local out code
+	[ -s "$SKETCH" ] || fail "No sketch uploaded"
+
+	# A .hex exported "with bootloader" already has records at 0x7000 and up,
+	# where the 32U4's Caterina bootloader lives. Otherwise add it, as the
+	# stock web panel did, so USB uploads keep working.
+	if ! grep -q '^:[0-9A-Fa-f][0-9A-Fa-f]7[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]00' "$SKETCH"; then
+		merge-sketch-with-bootloader.lua "$SKETCH" >/dev/null 2>&1
+	fi
+
+	kill-bridge >/dev/null 2>&1
+	out=$(run-avrdude "$SKETCH" 2>&1)
+	code=$?
+	rm -f "$SKETCH"
+
+	json_init
+	json_add_int code "$code"
+	json_add_string output "$(printf '%s\n' "$out" | tr -d '\r' | tail -c 4000)"
+	json_dump
+}
+
+m_mcu_reset() {
+	reset-mcu >/dev/null 2>&1 || fail "Couldn't reset the microcontroller"
+	ok
+}
+
+m_bridge_data() {
+	"$PY" "$LIB/helper.py" bridge-getall 2>/dev/null || { json_init; json_add_object values; json_close_object; json_dump; }
+}
+
+m_bridge_put() {
+	local key value
+	json_load "$INPUT"
+	json_get_var key key
+	json_get_var value value
+	[ -n "$key" ] || fail "Enter a key"
+	"$PY" "$LIB/helper.py" bridge-put "$key" "$value" >/dev/null 2>&1 || fail "The bridge isn't running"
+	ok
+}
+
+m_bridge_delete() {
+	local key
+	json_load "$INPUT"
+	json_get_var key key
+	[ -n "$key" ] || fail "No key given"
+	"$PY" "$LIB/helper.py" bridge-delete "$key" >/dev/null 2>&1 || fail "The bridge isn't running"
+	ok
+}
+
+m_mailbox_send() {
+	local message
+	json_load "$INPUT"
+	json_get_var message message
+	"$PY" "$LIB/helper.py" mailbox "$message" >/dev/null 2>&1 || fail "The bridge isn't running"
+	ok
+}
+
+m_settings_set() {
+	local hostname zonename rest_secure tz
+	json_load "$INPUT"
+	json_get_var hostname hostname
+	json_get_var zonename zonename
+	json_get_var rest_secure rest_secure
+
+	if [ -n "$hostname" ]; then
+		case "$hostname" in
+			*[!A-Za-z0-9_-]*|-*) fail "Use only letters, numbers, - and _ in the name" ;;
+		esac
+		[ ${#hostname} -le 63 ] || fail "The name is too long"
+	fi
+	if [ -n "$zonename" ]; then
+		tz=$(tz_for "$zonename") || fail "Unknown time zone: $zonename"
+	fi
+
+	if [ -n "$hostname" ]; then
+		uci set system.@system[0].hostname="$hostname"
+		if [ $STOCK = 1 ]; then
+			uci -q set network.lan.hostname="$hostname"
+			uci -q set network.wan.hostname="$hostname"
+		fi
+		echo "$hostname" > /proc/sys/kernel/hostname
+	fi
+	if [ -n "$zonename" ]; then
+		uci set system.@system[0].zonename="$zonename"
+		uci set system.@system[0].timezone="$tz"
+		echo "$tz" > /tmp/TZ
+	fi
+	if [ -n "$rest_secure" ]; then
+		uci -q set arduino.@arduino[0].secure_rest_api="$([ "$rest_secure" = 1 ] && echo true || echo false)"
+	fi
+	uci commit
+
+	# Announce the new name over mDNS.
+	if [ -n "$hostname" ]; then
+		if [ -x /etc/init.d/umdns ]; then
+			later /etc/init.d/umdns reload
+		elif [ -x /etc/init.d/avahi-daemon ]; then
+			later /etc/init.d/avahi-daemon restart
+		fi
+	fi
+	ok
+}
+
+m_password_set() {
+	local password hash
+	json_load "$INPUT"
+	json_get_var password password
+	[ ${#password} -ge 8 ] || fail "Use at least 8 characters"
+
+	( echo "$password"; sleep 1; echo "$password" ) | passwd root >/dev/null 2>&1 || fail "Couldn't set the password"
+
+	# The stock firmware also keeps a SHA-256 of the password for its panel.
+	if [ $STOCK = 1 ] && uci -q get arduino.@arduino[0].password >/dev/null; then
+		hash=$(printf '%s' "$password" | "$PY" "$LIB/helper.py" sha256)
+		[ -n "$hash" ] && uci set arduino.@arduino[0].password="$hash" && uci commit arduino
+	fi
+	ok
+}
+
+m_update_check() {
+	firmware_info
+	json_init
+	json_add_boolean supported 0
+	json_add_boolean available 0
+	json_add_string current "$FW_VERSION"
+	json_dump
+}
+
+m_update_apply() {
+	fail "Firmware updates aren't available from this panel yet"
+}
+
+m_reboot() {
+	later reboot
+	ok
+}
+
+# --- rpcd plugin protocol ----------------------------------------------------
+
+case "$1" in
+list)
+	cat <<-'EOF'
+	{
+		"status": {},
+		"wifi_scan": {},
+		"wifi_client": { "ssid": "str", "encryption": "str", "key": "str" },
+		"wifi_setup_ap": {},
+		"sketch_flash": {},
+		"mcu_reset": {},
+		"bridge_data": {},
+		"bridge_put": { "key": "str", "value": "str" },
+		"bridge_delete": { "key": "str" },
+		"mailbox_send": { "message": "str" },
+		"settings_set": { "hostname": "str", "zonename": "str", "rest_secure": true },
+		"password_set": { "password": "str" },
+		"update_check": {},
+		"update_apply": {},
+		"reboot": {}
+	}
+	EOF
+	;;
+call)
+	INPUT=$(cat)
+	case "$2" in
+		status|wifi_scan|wifi_client|wifi_setup_ap|sketch_flash|mcu_reset|\
+		bridge_data|bridge_put|bridge_delete|mailbox_send|settings_set|\
+		password_set|update_check|update_apply|reboot)
+			"m_$2"
+			;;
+		*) fail "Unknown method $2" ;;
+	esac
+	;;
+esac

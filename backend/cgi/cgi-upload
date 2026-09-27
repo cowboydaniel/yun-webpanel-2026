@@ -1,0 +1,5 @@
+#!/bin/sh
+# Stand-in for cgi-io's upload on boards without it; see
+# /usr/share/yun-panel/upload.py.
+PY=$(command -v python3 || command -v python)
+exec "$PY" /usr/share/yun-panel/upload.py
