@@ -134,6 +134,8 @@
   let status = null;
   const memHistory = [];
   let pollTimer = null;
+  let clockTimer = null;
+  let clockOffset = null;   // board time minus this computer's time, in ms
   let dataTimer = null;
   let lastData = {};
 
@@ -170,7 +172,10 @@
     const host = s.hostname || 'Arduino';
     document.title = `${host} · Yún Panel`;
     $('#board-name').textContent = host;
-    $('#board-sub').textContent = [s.model, s.time && new Date(s.time * 1000).toLocaleString()].filter(Boolean).join(' · ');
+    // Status arrives every 3 s; the clock ticks every second from the
+    // board's time, measured against this computer's clock.
+    clockOffset = s.time ? s.time * 1000 - Date.now() : null;
+    renderClock();
 
     const pill = $('#conn-pill');
     pill.className = 'pill is-ok';
@@ -252,6 +257,11 @@
     setKV($('#fw-kv'), [
       ['Version', s.firmware?.version], ['OpenWrt', s.firmware?.openwrt], ['Kernel', s.firmware?.kernel],
     ]);
+  }
+
+  function renderClock() {
+    const time = clockOffset == null ? null : new Date(Date.now() + clockOffset).toLocaleString();
+    $('#board-sub').textContent = [status?.model, time].filter(Boolean).join(' · ');
   }
 
   function drawSpark(canvas, values) {
@@ -513,6 +523,7 @@
 
   function signedOut() {
     clearInterval(pollTimer);
+    clearInterval(clockTimer);
     clearInterval(dataTimer);
     api.logout();
     $('#shell').hidden = true;
@@ -526,6 +537,7 @@
     showView(location.hash.slice(1) || 'overview');
     await poll();
     pollTimer = setInterval(poll, 3000);
+    clockTimer = setInterval(renderClock, 1000);
   }
 
   async function start() {
